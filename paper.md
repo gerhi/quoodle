@@ -62,7 +62,7 @@ For educators, the statistics dashboard surfaces three categories of insight. Th
 
 # Implementation
 
-Given the very limited requirements, it was decided that this could be something that could be vibe-coded using Claude.ai. Describing the basic requirements yielded a first running version that was iteratively adapted and finally shared with colleagues. To make the development easier a detailed requirement sheet was also developed so that others could adapt it to their use case.  
+Given the very limited requirements, it was decided that this could be something that could be vibe-coded using Claude.ai. Describing the basic requirements yielded a first running version that was iteratively adapted and finally shared with colleagues. It is in active use in my own classes and in research projects into the role of different feedback-intensities. To make it easier for others to adopt it to their own needs, a detailed requirement sheet was developed.
 
 `Quoodle` consists of approximately 30 files organised into page-level scripts (`index.php`, `upload.php`, `quiz.php`, `submit.php`, `share.php`,`stats.php`, `export.php`), a library directory (SQLite access, QR code generator, XLSX reader and writer, internationalisation), and a lightweight JavaScript/CSS front-end with no build step and no framework dependency.
 
