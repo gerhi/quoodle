@@ -49,6 +49,7 @@ Each quiz is a single persistent record (e.g., a JSON file). Fields:
 | `teacher_token` | string (24 hex chars) | Secret token for the educator URL. Generated from 12 random bytes. Never exposed to students. |
 | `title` | string (max 200 chars) | Quiz title, set by the educator at upload time. |
 | `created_at` | ISO 8601 datetime | Timestamp of quiz creation. |
+| `expires_at` | ISO 8601 datetime or `null` | Auto-deletion date. Default: 1 month after `created_at`. Set to `null` for no auto-deletion. Editable by the educator via the stats page. |
 | `questions` | array of Question | Ordered list of questions (see 3.2). |
 | `stats` | Stats object | Aggregated anonymous statistics (see 3.3). |
 
@@ -75,19 +76,32 @@ Each quiz is a single persistent record (e.g., a JSON file). Fields:
 | `correct_count` | integer | How many times this question was answered correctly. |
 | `total_count` | integer | How many times this question was answered in total. |
 | `choice_counts` | map (string → integer) | Keys are the exact answer texts (correct and distractors). Values are how often each was selected. |
+| `time_spent_sum` | float | Sum of all individual times-on-task for this question, in seconds. Used to compute the average: `time_spent_sum / total_count`. |
+| `time_spent_max` | float | Maximum time any single student spent on this question, in seconds. |
 
-### 3.5 What Is NOT Stored
+### 3.5 Stats-Level Fields (in addition to 3.3)
+
+| Field | Type | Description |
+|---|---|---|
+| `attempts` | integer | Total number of completed quiz submissions. |
+| `questions` | array of QuestionStats | One entry per question, in the same order as `questions`. |
+| `focus_lost_sum` | integer | Sum of all focus-loss events across all attempts. Used to compute average: `focus_lost_sum / attempts`. |
+| `focus_lost_max` | integer | Maximum number of focus-loss events in any single attempt. |
+
+### 3.6 What Is NOT Stored
 
 The following must **never** be stored in the quiz record or any other persistent store:
 
 - Individual answer sequences (which student chose what)
+- Individual per-question timings (only sums and maxima are stored; individual values cannot be reconstructed)
+- Individual focus-loss counts per attempt (only the sum and maximum across all attempts are stored)
 - IP addresses
 - User-agent strings
 - Session identifiers or tokens
 - Timestamps of individual submissions
 - Cookies or any cross-session identifier
 
-The system stores only the **aggregate counters** listed above. It must be technically impossible to reconstruct individual submissions from the stored data.
+The system stores only the **aggregate counters and sums** listed above. It must be technically impossible to reconstruct individual submissions from the stored data.
 
 ---
 
@@ -198,6 +212,43 @@ Questions are presented **one at a time** in a stepper interface:
 - The entire quiz is a single HTML form. All answers are submitted at once (not question by question).
 - Navigating back to a previous question preserves the previously selected answer.
 
+#### FR-08a: Immediate Correctness Feedback and Delay on Incorrect Answers
+
+When the student selects an answer and clicks **Next** (or **Submit** on the last question):
+
+1. The system **checks the answer against the correct answer client-side** and provides immediate visual feedback:
+   - **Correct answer:** The selected choice is briefly highlighted in green (✓). The student can proceed immediately (or the quiz auto-advances after a short visual confirmation, e.g., 0.5 seconds).
+   - **Incorrect answer:** The selected choice is highlighted in red (✗) and the correct answer is revealed in green (✓). The **Next / Submit button is disabled for 4 seconds**, during which a visible countdown is shown (e.g., "Wait 4s…", "3s…", "2s…", "1s…"). After the delay, the button re-enables and the student can proceed.
+
+2. This behavior serves two pedagogical purposes:
+   - Students who answer correctly experience a flow state with minimal interruption.
+   - Students who answer incorrectly are forced to pause and look at the correct answer, preventing rapid guessing through the quiz without engagement.
+
+3. **Implementation note:** Since the correct answer must be known client-side for instant checking, the correct answers are embedded in the page (e.g., in hidden fields or a JavaScript data structure). This is acceptable because Quoodle is a formative self-assessment tool, not a summative exam. A student who inspects the page source to find answers defeats only their own learning. The spec explicitly accepts this trade-off.
+
+4. **During the 4-second delay**, the student may review the correct answer but cannot change their selection for that question. The answer is locked once confirmed.
+
+5. The delay duration (4 seconds) should be defined as a configurable constant, not hardcoded in multiple places.
+
+#### FR-08b: Time-on-Task Tracking
+
+The client must track the **time spent on each question** in seconds (wall-clock time from the moment the question becomes visible to the moment the student confirms their answer by clicking Next/Submit).
+
+- Time is measured per question using JavaScript (e.g., `performance.now()` or `Date.now()`).
+- Time spent during the 4-second incorrect-answer delay counts toward the question's time.
+- If the student navigates back to a previous question and changes their answer, the additional time is added to that question's total (cumulative).
+- Per-question times are stored in hidden form fields (e.g., `<input type="hidden" name="times[0]" value="12.3">`) and submitted with the form.
+- Times are recorded in seconds with one decimal place precision.
+
+#### FR-08c: Focus-Loss Tracking
+
+The client must track how many times the student **switches away from the quiz** during the attempt:
+
+- A focus-loss event is triggered whenever the browser tab or window loses focus. Use the [Page Visibility API](https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API) (`document.visibilitychange` event) or the `window.blur` event.
+- The total count of focus-loss events for the entire attempt is stored in a hidden form field (e.g., `<input type="hidden" name="focus_lost" value="3">`) and submitted with the form.
+- Only the count is tracked, not the timestamps or durations of the focus losses.
+- The time during which the tab is not visible does **not** count toward the per-question time-on-task (the timer should pause when the tab is hidden and resume when it becomes visible again).
+
 #### FR-09: Answer Shuffling
 
 On each page load, the order of answer choices (correct + distractors) for each question is randomized. The shuffle must be different across page loads so that sharing an answer-position sequence ("A, C, B, D") is ineffective.
@@ -221,10 +272,15 @@ After submission, the student sees:
 - Large display: "{correct} / {total}" (e.g., "5 / 8").
 - Percentage: "{percent}% correct."
 
+**Attempt summary (below score banner):**
+- **Total time:** The sum of all per-question times, formatted as minutes and seconds (e.g., "Total time: 4 min 23 s").
+- **Focus losses:** The number of times the student switched away from the quiz tab (e.g., "Tab switches: 2"). If zero, this line may be omitted or shown as "Tab switches: 0 ✓".
+
 **Per-question feedback (all questions, scrollable):**
 
 For each question:
 - Question number and a status badge ("Correct" in green or "Incorrect" in red).
+- **Time spent** on this question (e.g., "18.4 s"), displayed as a subtle label next to the question number.
 - The question text.
 - All answer choices listed. The correct answer is highlighted in green with a ✓ marker. If the student's answer was wrong, it is highlighted in red with a ✗ marker and labeled "your answer." Unchosen distractors are shown in neutral styling.
 - The educator's explanation, if non-empty, displayed in a visually distinct block (e.g., blue-bordered callout).
@@ -243,12 +299,15 @@ Accessible at `{base}/stats.php?id={id}&t={token}` (or equivalent). Access witho
 - Total attempts (count).
 - Number of questions.
 - Average percentage correct across all questions (or "—" if no attempts yet).
+- Average time per attempt (sum of all per-question times, averaged across attempts), formatted as "Ø {m} min {s} s".
+- Average tab switches per attempt (e.g., "Ø 1.3 tab switches"). If the average is ≤ 0.5, display in green; if > 2, display in amber/red as a signal that many students may have looked up answers.
 
 **Per-question breakdown:**
 
 For each question:
 - Question number and text.
 - Fraction and percentage correct (e.g., "34/56 · 61%").
+- **Average time on this question** (e.g., "Ø 14.2 s") and **maximum time** (e.g., "max 48.1 s"), displayed as subtle labels.
 - A horizontal bar visualizing the correct percentage, color-coded:
   - Green: ≥ 75%
   - Amber/orange: 50–74%
@@ -269,6 +328,13 @@ For each question:
 - CSV export (see FR-16).
 - Export buttons are only shown if at least one attempt has been recorded.
 
+**Expiry management (below action buttons or in a sidebar/card):**
+- Current expiry date with countdown (see FR-18, display rules 8–9).
+- Controls to change the expiry: date input and/or quick buttons (+1 month, +3 months, never). See FR-18.
+
+**Danger zone (visually separated, at the bottom):**
+- Delete quiz button (see FR-17).
+
 #### FR-13: Results Page — Unknown Answers
 
 If the `choice_counts` map contains keys that don't match any known answer option (defensive case — should not occur in normal operation), display them at the bottom of the question's breakdown with a "?" marker and "(unknown answer)" label.
@@ -282,7 +348,13 @@ When a student submits a quiz:
    - Increment `questions[i].total_count` by 1.
    - If the answer was correct, increment `questions[i].correct_count` by 1.
    - Increment `questions[i].choice_counts[answer_text]` by 1 (create the key if it doesn't exist).
-3. Persist the updated quiz record.
+   - Add the submitted per-question time to `questions[i].time_spent_sum`.
+   - Update `questions[i].time_spent_max` if the submitted time exceeds the current maximum.
+3. Add the submitted focus-loss count to `stats.focus_lost_sum`.
+4. Update `stats.focus_lost_max` if the submitted count exceeds the current maximum.
+5. Persist the updated quiz record.
+
+**Input validation:** The server must validate the submitted time and focus values. Times must be non-negative numbers; the focus count must be a non-negative integer. Invalid or missing values should be treated as 0 (do not reject the entire submission).
 
 **Concurrency:** Multiple students may submit simultaneously (e.g., 200 students in a lecture hall). The update mechanism must be atomic or use locking to prevent lost updates. In a file-based implementation, use exclusive file locks. In a database implementation, use transactions or atomic increments.
 
@@ -306,13 +378,16 @@ Generates an `.xlsx` file with three worksheets:
 | Total attempts | {number} |
 | Number of questions | {number} |
 | Average correct (%) | {number} |
+| Average time per attempt | {seconds} |
+| Average tab switches per attempt | {number} |
+| Maximum tab switches in a single attempt | {number} |
 | Created | {date} |
 
 **Sheet 2: "Questions"**
 
-| Nr. | Question | Correct answer | Attempts | Correct | Correct (%) |
-|---|---|---|---|---|---|
-| 1 | {text} | {text} | {n} | {n} | {pct} |
+| Nr. | Question | Correct answer | Attempts | Correct | Correct (%) | Avg time (s) | Max time (s) |
+|---|---|---|---|---|---|---|---|
+| 1 | {text} | {text} | {n} | {n} | {pct} | {avg} | {max} |
 
 **Sheet 3: "Answer Options"**
 
@@ -331,6 +406,58 @@ Header rows should be bold. The filename should follow the pattern: `Quoodle_{sa
 Same data as the Excel export, but in a single CSV file with section headers. Use semicolon as delimiter (European locale compatibility). Include a UTF-8 BOM (`\xEF\xBB\xBF`) so Excel auto-detects the encoding.
 
 Filename: `Quoodle_{sanitized_title}_{date}.csv`.
+
+### 4.5 Quiz Lifecycle (Educator Flow)
+
+#### FR-17: Manual Quiz Deletion
+
+The stats page (educator view) must include a **Delete quiz** action. Behavior:
+
+1. The delete button is visually separated from the other action buttons (e.g., placed at the bottom of the page, styled as a danger/destructive action — red outline or red text, not a primary button).
+2. Clicking the button shows a **confirmation step** before deletion. Two acceptable patterns:
+   - A confirmation dialog (JavaScript `confirm()` is acceptable for simplicity), or
+   - An inline confirmation panel that replaces the button with "Are you sure? This cannot be undone." and two buttons: "Yes, delete" (destructive) and "Cancel."
+3. Upon confirmation, the server:
+   - Verifies the teacher token (same authorization as the stats page).
+   - Deletes the quiz record (e.g., removes the JSON file).
+   - Redirects to the landing page with a brief success message (e.g., flash message or URL parameter `?deleted=1`).
+4. After deletion:
+   - The student quiz URL returns a 404 ("quiz not found").
+   - The teacher stats URL returns a 404.
+   - The share page URL returns a 404.
+   - Any export URLs return a 404.
+5. Deletion is **permanent and irreversible**. There is no recycle bin or undo.
+
+#### FR-18: Auto-Deletion Date
+
+Each quiz has an expiration date (`expires_at`) that controls automatic deletion.
+
+**Setting the expiry:**
+
+1. At creation time, `expires_at` is set to **1 month (30 days) after `created_at`** by default.
+2. On the stats page, the educator sees the current expiry date and can:
+   - **Extend** it (e.g., by selecting a new date via a date input, or by clicking a "+1 month" / "+3 months" / "+1 year" quick button).
+   - **Remove** it entirely (set to "never expires" / `null`).
+   - **Shorten** it (set it to an earlier date, including today for immediate expiration on next cleanup).
+3. Changing the expiry date requires the teacher token (same authorization as the stats page). The change is submitted as a POST request and the page reloads with the updated value.
+4. On the share page, the expiry date is also displayed (read-only) so the educator is aware when creating the quiz.
+
+**Enforcement:**
+
+5. **On access (lazy check):** Whenever `load_quiz(id)` is called, the system checks whether `expires_at` is non-null and in the past. If so, the quiz file is deleted immediately and the function returns null (quiz not found). This ensures that expired quizzes are cleaned up without requiring a cron job or background process.
+6. **Periodic sweep (optional, recommended):** On the landing page, the system may additionally scan the data directory for expired quiz files and delete them. To avoid performance overhead on every page load, this sweep should be rate-limited (e.g., at most once per hour, tracked via a simple timestamp file like `data/.last_sweep`).
+7. **Grace period:** There is no grace period. Once `expires_at` passes, the next access triggers deletion.
+
+**Display:**
+
+8. On the stats page, the expiry date is shown in a clearly visible location (e.g., near the quiz title or in the summary cards area). The display must include:
+   - The expiry date formatted in the user's locale (e.g., "15. Juli 2026" / "July 15, 2026").
+   - A human-readable countdown (e.g., "in 23 days" / "in 23 Tagen"), color-coded:
+     - Green: more than 14 days remaining.
+     - Amber: 3–14 days remaining.
+     - Red: fewer than 3 days remaining.
+     - If `null`: display "No expiry" / "Kein Ablaufdatum" in neutral styling.
+9. On the share page, the expiry date is shown as a read-only note below the quiz title (e.g., "This quiz expires on July 15, 2026.").
 
 ---
 
@@ -390,6 +517,10 @@ The application must not set tracking cookies, session cookies, or analytics coo
 - `theme` — stores the user's theme preference (`light` or `dark`). Max-age: 1 year.
 
 Both cookies contain no personal data and are not used for identification.
+
+#### PRIV-03a: Time and Focus Data
+
+Per-question time-on-task and focus-loss counts are collected client-side and submitted with the quiz form. On the server, only **aggregate values** are stored (sums and maxima across all attempts). Individual per-attempt time profiles and focus-loss counts are displayed to the submitting student on their feedback page but are **not persisted**. It must be impossible to reconstruct an individual student's timing or focus pattern from the stored aggregates.
 
 #### PRIV-04: No External Requests
 
@@ -696,6 +827,98 @@ The stats recording mechanism must handle at least 200 simultaneous submissions 
 1. Note the student URL for a quiz (contains only `id`).
 2. Verify: knowing the `id` does not allow constructing the teacher URL. The `teacher_token` is independent and generated from a separate random source.
 
+### TC-12: Immediate Correctness Feedback
+
+1. Open a quiz with 3 questions.
+2. Select the **correct** answer for question 1. Click "Next."
+3. Verify: the selected answer is briefly highlighted in green (✓). The quiz advances immediately (or after a brief ~0.5s visual confirmation).
+4. Select an **incorrect** answer for question 2. Click "Next."
+5. Verify: the selected answer is highlighted in red (✗). The correct answer is revealed in green (✓). The "Next" button is disabled.
+6. Verify: a visible countdown ("4s…", "3s…", "2s…", "1s…") is shown.
+7. Verify: the "Next" button re-enables after exactly 4 seconds.
+8. Click "Next." Verify: question 3 appears.
+
+### TC-13: Delay — Cannot Bypass
+
+1. On an incorrect answer, while the countdown is active, verify:
+   - Clicking the disabled "Next" button does nothing.
+   - Pressing Enter does not advance.
+   - The student cannot change their answer selection for this question.
+2. After the countdown completes, verify the student can proceed normally.
+
+### TC-14: Time-on-Task Tracking
+
+1. Open a quiz with 2 questions.
+2. Spend approximately 10 seconds on question 1 (select an answer and click Next).
+3. Spend approximately 5 seconds on question 2 (select an answer and submit).
+4. Verify: the feedback page shows per-question times approximately matching (within ±2s of the actual time spent).
+5. Verify: the feedback page shows a total time that is the sum of both per-question times.
+6. Open the stats page. Verify: average time per question is populated and plausible.
+
+### TC-15: Time Pauses on Tab Switch
+
+1. Open a quiz. Start question 1.
+2. Switch to another browser tab for 10 seconds.
+3. Switch back. Select an answer and proceed.
+4. Verify: the time reported for question 1 does **not** include the 10 seconds spent on the other tab.
+
+### TC-16: Focus-Loss Tracking
+
+1. Open a quiz with 3 questions.
+2. Switch away from the tab 3 times during the quiz (at any point).
+3. Submit the quiz.
+4. Verify: the feedback page shows "Tab switches: 3."
+5. Open the stats page. Verify: the focus-loss aggregate is updated (e.g., if this is the only attempt, average = 3, max = 3).
+
+### TC-17: Export Includes Time and Focus Data
+
+1. Create a quiz. Submit 2 attempts with different timings.
+2. Download the Excel export.
+3. Verify: the Summary sheet includes average time per attempt and average/max tab switches.
+4. Verify: the Questions sheet includes "Avg time (s)" and "Max time (s)" columns with plausible values.
+
+### TC-18: Manual Quiz Deletion
+
+1. Create a quiz. Note the student URL and teacher URL.
+2. Open the stats page (teacher URL).
+3. Click "Delete quiz."
+4. Verify: a confirmation prompt appears. Cancel it. Verify: the quiz still exists.
+5. Click "Delete quiz" again. Confirm.
+6. Verify: redirected to the landing page with a success message.
+7. Open the student URL. Verify: 404 (quiz not found).
+8. Open the teacher stats URL. Verify: 404.
+9. Open the share page URL. Verify: 404.
+
+### TC-19: Manual Deletion Requires Token
+
+1. Attempt to send a DELETE/POST request to the delete endpoint without a valid teacher token.
+2. Verify: 404 (not 200 or 403 — do not reveal that the quiz exists).
+
+### TC-20: Auto-Expiry Default
+
+1. Create a quiz.
+2. Open the stats page.
+3. Verify: the expiry date is displayed and is approximately 30 days in the future.
+4. Verify: the countdown is shown in green (>14 days).
+
+### TC-21: Auto-Expiry Enforcement
+
+1. Create a quiz. Manually edit the quiz file to set `expires_at` to a past date (e.g., yesterday).
+2. Open the student quiz URL. Verify: 404 (quiz auto-deleted on access).
+3. Verify: the quiz file no longer exists on disk.
+
+### TC-22: Extend Expiry
+
+1. Create a quiz. Open the stats page.
+2. Click "+1 month." Verify: the expiry date updates to ~60 days from creation.
+3. Click "Never." Verify: the expiry shows "No expiry" / "Kein Ablaufdatum."
+4. Set a specific date via the date picker. Verify: the expiry updates accordingly.
+
+### TC-23: Expiry Display on Share Page
+
+1. Create a quiz. Open the share page.
+2. Verify: the expiry date is shown as a read-only note (e.g., "This quiz expires on [date]").
+
 ---
 
 ## 13. Pages Summary
@@ -708,7 +931,9 @@ The stats recording mechanism must handle at least 200 simultaneous submissions 
 | `/quiz?id=X` | Public | Student-facing quiz with stepper navigation. |
 | `/submit` | POST only | Grades answers, records stats, displays feedback. |
 | `/stats?id=X&t=T` | Teacher token | Analytics dashboard with per-question breakdown. |
-| `/export?id=X&t=T&format=xlsx|csv` | Teacher token | Downloads results as Excel or CSV. |
+| `/stats` (POST actions) | Teacher token | Updates expiry date (`action=set_expiry`) or deletes quiz (`action=delete`). |
+| `/export?id=X&t=T&format=xlsx` | Teacher token | Downloads results as Excel. |
+| `/export?id=X&t=T&format=csv` | Teacher token | Downloads results as CSV. |
 | `/impressum` | Public | Legal notice (template). |
 | `/datenschutz` or `/privacy` | Public | Privacy policy (template). |
 
@@ -719,9 +944,12 @@ The stats recording mechanism must handle at least 200 simultaneous submissions 
 | Term | Definition |
 |---|---|
 | **Distractor** | An incorrect answer option in a single-choice question, designed to be plausible. |
+| **Expiry date** | The date after which a quiz is automatically deleted on next access. Default: 30 days after creation. Can be changed or removed by the educator. |
+| **Focus loss** | An event where the student's browser tab or window loses visibility (e.g., switching to another tab, minimizing the window). Tracked via the Page Visibility API. |
 | **Formative assessment** | Low-stakes evaluation used to monitor learning and provide feedback, not for grading. |
 | **Stepper** | A UI pattern showing one item at a time with forward/back navigation and a progress indicator. |
 | **Teacher token** | A secret random string that grants access to the analytics and export pages for a specific quiz. |
+| **Time-on-task** | Wall-clock time a student spends actively viewing and answering a specific question, excluding time when the tab is not visible. |
 | **FOUC** | Flash of unstyled content — a brief display of default styling before the intended styles load. |
 
 ---
