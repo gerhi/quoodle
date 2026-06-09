@@ -22,7 +22,7 @@ bibliography: paper.bib
 
 `Quoodle` is a minimalist, self-contained web application for creating and distributing multiple-choice knowledge checks in educational settings. The workflow is familiar to anyone who used a doodle.com to schedule a meeting (see fig. 1 below). A teacher uploads a spreadsheet of questions; quoodle returns a shareable URL and QR code for learners, along with a separate URL through which the teacher can view aggregated results. Learners can answer the quiz on any device, receive immediate per-question feedback with an explanation, and see their score and basic information on upon completion. The teacher sees class-level statistics — success rates per question, distribution of selected distractors, average completion time, and a tab-switching indicator — but no individual submission records.
 
-![Figure 1. Overview of Quoodle. A.) Landing page to create a quizz. B.) Quizz-taking view for students with feedback. C.) Quizz-result view for students. D.) Result-view for teachers.](fig_1_Quoodle_overview.png)
+![Figure 1. Overview of Quoodle. A.) Landing page to create a quizz. B.) Quizz-taking view for students with feedback. C.) Quizz-result view for students. D.) Result-view for teachers.](screenshots/fig_1_Quoodle_overview.png)
 
 
 # Statement of need
