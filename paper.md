@@ -22,20 +22,20 @@ bibliography: paper.bib
 
 `Quoodle` is a minimalist, self-contained web application for creating and distributing multiple-choice knowledge checks in educational settings. The workflow is familiar to anyone who used a doodle.com to schedule a meeting (see fig. 1 below). A teacher uploads a spreadsheet of questions; quoodle returns a shareable URL and QR code for learners, along with a separate URL through which the teacher can view aggregated results. Learners can answer the quiz on any device, receive immediate per-question feedback with an explanation, and see their score and basic information on upon completion. The teacher sees class-level statistics — success rates per question, distribution of selected distractors, average completion time, and a tab-switching indicator — but no individual submission records.
 
-![Figure 1. Overview of Quoodle. A.) Landing page to create a quizz. B.) Quizz-taking view for students with feedback. C.) Quizz-result view for students. D.) Result-view for teachers.](screenshots/fig_1_Quoodle_overview.png)
+![Figure 1. Overview of Quoodle. A.) Landing page to create a quizz. B.) Quizz-taking view for students with feedback. C.) Quizz-result view for students. D.) Result-view for teachers.](fig_1_Quoodle_overview.png)
 
 
 # Statement of need
 
-Formative assessment through short knowledge checks is a well-established classroom practice that is highly efficient in improving student learning [@Hattie2007]. However, in Germany less than 20% of university students report receiving regular feedback [@Multrus2017Studi-47447]. Many tools exist to close this gap from proprietary platforms such as Kahoot! and Quizlet to open-source alternatives like ClassQuiz [@classquiz]. Existing tools, however, impose one or more barriers to their wide-spread adoption of quizzes to support student learning.
+Formative assessment through short knowledge checks is a well-established classroom practice that is highly efficient in improving student learning [@Hattie2007]. However, in Germany less than 20% of university students report receiving regular feedback [@Multrus2017Studi-47447]. In fact the project was started a colleague asked about a simple tool to present multiple-choice questions that students can work on on their own. A quick search revealed that many tools exist, e.g. proprietary platforms such as Kahoot! and Quizlet or open-source alternatives like ClassQuiz [@classquiz]. Existing tools, however, impose one or more barriers to their wide-spread adoption of quizzes to support student learning.
 
-1. **Student accounts.** Most platforms require learners to create an account or join a session identified by a persistent pseudonym.
+1. **Student/Teacher accounts.** Most platforms require learners to create an account or join a session identified by a persistent pseudonym.
 2. **Third-party data processing.** Hosted platforms typically process student interaction data on servers outside the educator's legal jurisdiction, creating friction with the EU General Data Protection Regulation [@gdpr] and regional school-data-protection directives.
 3. **Infrastructure complexity.** Open-source alternatives often require Docker, a separate database server, a message broker, and a reverse proxy — a barrier for individual teachers, small schools, and resource-constrained institutions.
-4. **Tracking and telemetry.** Even where not strictly required, many tools contact analytics services, CDNs, or sentry endpoints on every page load, surfacing data outside the trust boundary the learner expects.
+4. **Tracking and telemetry.** Even where not required, many tools contact analytics services, CDNs, or sentry endpoints on every page load, surfacing data outside the trust boundary the learner expects.
 4. **Correctness-only feedback without explanations.** Most existing tools are not designed to foster self-regulated learning only provide feedback on the correctness or incorrectness of the responses without offering explanations.
 
-`Quoodle` addresses these barriers by focusing on a very limited application scenario rather than by configuration. Even for those teachers with access to learning-management systems, quoodle is faster, easier and simpler than most LMS-based tools that do not allow the import of existing multiple-choice tests. 
+`Quoodle` addresses these barriers by focusing on a very limited application scenario rather than aiming to cater to all different needs. Even for those teachers with access to learning-management systems, quoodle is faster, easier and simpler than most LMS-based tools that do not allow the import of existing multiple-choice tests. 
 
 - **No student or teacher accounts.** A quoodle is a transient activity to improve self-regulated learning. Learners access the quiz through a URL and are neither asked for a name nor tracked across sessions.
 - **No personally identifiable data is ever stored.** The database contains only aggregate counters — the number of submissions per quiz, how often each question was answered correctly, and how often each answer option was selected. Individual submissions are not persisted.
@@ -62,6 +62,8 @@ For educators, the statistics dashboard surfaces three categories of insight. Th
 
 # Implementation
 
+Given the very limited requirements, it was decided that this could be something that could be vibe-coded using Claude.ai. Describing the basic requirements yielded a first running version that was iteratively adapted and finally shared with colleagues. To make the development easier a detailed requirement sheet was also developed so that others could adapt it to their use case.  
+
 `Quoodle` consists of approximately 30 files organised into page-level scripts (`index.php`, `upload.php`, `quiz.php`, `submit.php`, `share.php`,`stats.php`, `export.php`), a library directory (SQLite access, QR code generator, XLSX reader and writer, internationalisation), and a lightweight JavaScript/CSS front-end with no build step and no framework dependency.
 
 The QR-code generator implements the full ISO/IEC 18004 encoding pipeline [@iso18004]. The XLSX reader and writer use PHP's built-in `ZipArchive` and `SimpleXML` extensions to parse and produce Office Open XML documents directly, without any external library. The writer supports multiple sheets, bold header rows, and shared-string deduplication.
@@ -69,6 +71,7 @@ The QR-code generator implements the full ISO/IEC 18004 encoding pipeline [@iso1
 Concurrent submissions are handled via SQLite's Write-Ahead Logging journal mode and `BEGIN IMMEDIATE` transactions, with an exponential-backoff retry loop bounded at ten attempts. Submissions that fail to record (e.g. on sustained lock contention) do not block the learner's feedback page — a deliberate trade-off that favours learner experience over perfect aggregation consistency in pathological cases. 
 
 The source code is availible at [https://github.com/gerhi/quoodle](https://github.com/gerhi/quoodle). A hosted version can be accessed at [http://www.gerrithirschfeld.de/quoodle](http://www.gerrithirschfeld.de/quoodle).
+
 
 # Acknowledgements
 
