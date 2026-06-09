@@ -1,472 +1,227 @@
 <?php
-declare(strict_types=1);
-
-// Ensure format_duration() is available — pages calling these functions
-// usually load helpers.php first, but this guarantees it in case they don't.
-require_once __DIR__ . '/helpers.php';
-
 /**
- * XlsxWriter – Minimal self-contained XLSX (Office Open XML) generator.
+ * Schlanker XLSX-Writer in reinem PHP.
  *
- * Creates a multi-sheet workbook using PHP's ZipArchive and raw XML.
- * No external libraries required.
+ * - Schreibt eine einzelne Arbeitsmappe mit einem Tabellenblatt.
+ * - Nutzt inline strings (keine shared strings table nötig).
+ * - Unterstützt numerische Werte und Strings; optional fette Kopfzeile.
  *
- * Usage:
- *   $wb = new XlsxWriter();
- *   $wb->add_sheet('Sheet1', [['A','B'], [1, 2]]);
- *   $bytes = $wb->build();
- *   header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
- *   echo $bytes;
+ * Abhängigkeiten: nur `ZipArchive` (PHP-Standard).
+ * Ausgabe: direkt an den Browser als Download.
+ *
+ * Verwendung:
+ *   $writer = new XlsxWriter();
+ *   $writer->addSheet('Auswertung', [
+ *       ['Frage', 'Richtig', 'Gesamt', 'Quote'],   // Header
+ *       ['Frage 1', 42, 56, 0.75],
+ *       ['Frage 2', 31, 56, 0.55],
+ *   ]);
+ *   $writer->output('auswertung.xlsx');
  */
-final class XlsxWriter {
-
-    /** @var array{name: string, rows: array}[] */
+final class XlsxWriter
+{
+    /** @var array<array{name: string, rows: array<array<int, string|int|float|null>>}> */
     private array $sheets = [];
 
-    /** Add a sheet. $rows is a 2D array of scalars. */
-    public function add_sheet(string $name, array $rows): void {
+    /** @var int Anzahl Zeilen, die fett gesetzt werden sollen (ab Zeile 1). Standard 1 = Header fett. */
+    private int $boldHeaderRows = 1;
+
+    public function addSheet(string $name, array $rows): void
+    {
+        // Sheet-Namen: max 31 Zeichen, keine : \ / ? * [ ]
+        $name = preg_replace('/[:\\\\\\/\\?\\*\\[\\]]/', '_', $name);
+        $name = substr($name, 0, 31);
+        if ($name === '') $name = 'Sheet';
         $this->sheets[] = ['name' => $name, 'rows' => $rows];
     }
 
-    /**
-     * Build the XLSX binary and return it as a string.
-     * Uses a temporary file internally (ZipArchive requires a file path).
-     */
-    public function build(): string {
-        // Pick a temp directory: prefer sys_get_temp_dir(), fall back to the
-        // data/ folder (which is writable by the app) if the system temp is not.
-        $temp_dir = sys_get_temp_dir();
-        if (!is_dir($temp_dir) || !is_writable($temp_dir)) {
-            $temp_dir = __DIR__ . '/../data';
-            if (!is_dir($temp_dir)) @mkdir($temp_dir, 0750, true);
-        }
+    public function setBoldHeaderRows(int $n): void
+    {
+        $this->boldHeaderRows = max(0, $n);
+    }
 
-        $tmp = @tempnam($temp_dir, 'qd_xlsx_');
-        if ($tmp === false) {
-            throw new \RuntimeException(
-                'Konnte keine temporäre Datei in "' . $temp_dir . '" anlegen. ' .
-                'Bitte Schreibrechte prüfen.'
-            );
+    /**
+     * Sendet die XLSX-Datei als Download an den Browser.
+     * Ruft exit auf.
+     */
+    public function output(string $filename): void
+    {
+        $tmp = tempnam(sys_get_temp_dir(), 'xlsx_');
+        $this->writeToFile($tmp);
+
+        $size = filesize($tmp);
+        $safeName = preg_replace('/[^A-Za-z0-9_\-\.]/', '_', $filename);
+
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment; filename="' . $safeName . '"');
+        header('Content-Length: ' . $size);
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('Pragma: no-cache');
+
+        readfile($tmp);
+        @unlink($tmp);
+        exit;
+    }
+
+    private function writeToFile(string $path): void
+    {
+        if (empty($this->sheets)) {
+            throw new RuntimeException('Keine Tabellenblätter zum Schreiben.');
         }
 
         $zip = new ZipArchive();
-        // CREATE | OVERWRITE handles both new and existing target files safely.
-        $open_result = $zip->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-        if ($open_result !== true) {
-            @unlink($tmp);
-            throw new \RuntimeException('ZipArchive::open fehlgeschlagen (Code ' . (int)$open_result . ').');
+        if ($zip->open($path, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            throw new RuntimeException('Konnte XLSX-Datei nicht zum Schreiben öffnen.');
         }
 
-        $zip->addFromString('[Content_Types].xml',  $this->content_types());
-        $zip->addFromString('_rels/.rels',           $this->root_rels());
-        $zip->addFromString('xl/workbook.xml',        $this->workbook_xml());
-        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbook_rels());
-        $zip->addFromString('xl/styles.xml',          $this->styles_xml());
-        $zip->addFromString('xl/sharedStrings.xml',   $this->shared_strings_xml());
-
-        foreach ($this->sheets as $i => $sheet) {
-            $zip->addFromString(
-                'xl/worksheets/sheet' . ($i + 1) . '.xml',
-                $this->sheet_xml($sheet['rows'])
-            );
+        // [Content_Types].xml
+        $zip->addFromString('[Content_Types].xml', $this->contentTypesXml());
+        // _rels/.rels
+        $zip->addFromString('_rels/.rels', $this->topRelsXml());
+        // xl/workbook.xml
+        $zip->addFromString('xl/workbook.xml', $this->workbookXml());
+        // xl/_rels/workbook.xml.rels
+        $zip->addFromString('xl/_rels/workbook.xml.rels', $this->workbookRelsXml());
+        // xl/styles.xml
+        $zip->addFromString('xl/styles.xml', $this->stylesXml());
+        // Sheets
+        foreach ($this->sheets as $idx => $sheet) {
+            $zip->addFromString('xl/worksheets/sheet' . ($idx + 1) . '.xml', $this->sheetXml($sheet['rows']));
         }
 
-        if (!$zip->close()) {
-            @unlink($tmp);
-            throw new \RuntimeException('ZipArchive::close fehlgeschlagen.');
-        }
-
-        $bytes = @file_get_contents($tmp);
-        @unlink($tmp);
-
-        if ($bytes === false || $bytes === '') {
-            throw new \RuntimeException('Erzeugte XLSX-Datei ist leer oder konnte nicht gelesen werden.');
-        }
-        return $bytes;
+        $zip->close();
     }
 
-    // ── [Content_Types].xml ──────────────────────────────────────────────
-    private function content_types(): string {
-        $sheets = '';
-        foreach ($this->sheets as $i => $_) {
-            $n = $i + 1;
-            $sheets .= '<Override PartName="/xl/worksheets/sheet' . $n . '.xml"'
-                     . ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+    // ---- XML-Generatoren ----
+
+    private function contentTypesXml(): string
+    {
+        $parts = [];
+        foreach ($this->sheets as $idx => $_s) {
+            $n = $idx + 1;
+            $parts[] = '<Override PartName="/xl/worksheets/sheet' . $n . '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
         }
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              . '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
              . '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-             . '<Default Extension="xml"  ContentType="application/xml"/>'
-             . '<Override PartName="/xl/workbook.xml"'
-             . ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-             . '<Override PartName="/xl/styles.xml"'
-             . ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-             . '<Override PartName="/xl/sharedStrings.xml"'
-             . ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
-             . $sheets
+             . '<Default Extension="xml" ContentType="application/xml"/>'
+             . '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+             . '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+             . implode('', $parts)
              . '</Types>';
     }
 
-    // ── _rels/.rels ──────────────────────────────────────────────────────
-    private function root_rels(): string {
+    private function topRelsXml(): string
+    {
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-             . '<Relationship Id="rId1"'
-             . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"'
-             . ' Target="xl/workbook.xml"/>'
+             . '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
              . '</Relationships>';
     }
 
-    // ── xl/workbook.xml ──────────────────────────────────────────────────
-    private function workbook_xml(): string {
-        $sheets_xml = '';
-        foreach ($this->sheets as $i => $s) {
-            $n = $i + 1;
-            $name = htmlspecialchars($s['name'], ENT_XML1, 'UTF-8');
-            $sheets_xml .= '<sheet name="' . $name . '" sheetId="' . $n . '" r:id="rId' . $n . '"/>';
+    private function workbookXml(): string
+    {
+        $sheetTags = '';
+        foreach ($this->sheets as $idx => $sheet) {
+            $n = $idx + 1;
+            $name = htmlspecialchars($sheet['name'], ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $sheetTags .= '<sheet name="' . $name . '" sheetId="' . $n . '" r:id="rId' . $n . '"/>';
         }
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-             . '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
-             . '  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-             . '<sheets>' . $sheets_xml . '</sheets>'
+             . '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+             . 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+             . '<sheets>' . $sheetTags . '</sheets>'
              . '</workbook>';
     }
 
-    // ── xl/_rels/workbook.xml.rels ───────────────────────────────────────
-    private function workbook_rels(): string {
-        $rels = '';
-        foreach ($this->sheets as $i => $_) {
-            $n = $i + 1;
-            $rels .= '<Relationship Id="rId' . $n . '"'
-                   . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"'
-                   . ' Target="worksheets/sheet' . $n . '.xml"/>';
+    private function workbookRelsXml(): string
+    {
+        $rels = '<Relationship Id="rStyle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>';
+        foreach ($this->sheets as $idx => $_s) {
+            $n = $idx + 1;
+            $rels .= '<Relationship Id="rId' . $n . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' . $n . '.xml"/>';
         }
-        $last = count($this->sheets);
-        $rels .= '<Relationship Id="rId' . ($last + 1) . '"'
-               . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"'
-               . ' Target="styles.xml"/>';
-        $rels .= '<Relationship Id="rId' . ($last + 2) . '"'
-               . ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"'
-               . ' Target="sharedStrings.xml"/>';
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
              . $rels
              . '</Relationships>';
     }
 
-    // ── xl/styles.xml — minimal: 2 styles (normal + bold header) ─────────
-    private function styles_xml(): string {
+    /**
+     * Styles: Index 0 = Standard, Index 1 = Fett (für Header).
+     */
+    private function stylesXml(): string
+    {
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              . '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
              . '<fonts count="2">'
-             . '<font><sz val="11"/><name val="Calibri"/></font>'
-             . '<font><b/><sz val="11"/><name val="Calibri"/></font>'
+             .   '<font><sz val="11"/><name val="Calibri"/></font>'
+             .   '<font><b/><sz val="11"/><name val="Calibri"/></font>'
              . '</fonts>'
              . '<fills count="2">'
-             . '<fill><patternFill patternType="none"/></fill>'
-             . '<fill><patternFill patternType="gray125"/></fill>'
+             .   '<fill><patternFill patternType="none"/></fill>'
+             .   '<fill><patternFill patternType="gray125"/></fill>'
              . '</fills>'
              . '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
              . '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
              . '<cellXfs count="2">'
-             . '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'       // style 0: normal
-             . '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0"/>'       // style 1: bold
+             .   '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+             .   '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
              . '</cellXfs>'
+             . '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
              . '</styleSheet>';
     }
 
-    // ── xl/sharedStrings.xml ─────────────────────────────────────────────
-    // We store all string values here for proper Unicode support.
-    private function shared_strings_xml(): string {
-        $strings = [];
-        foreach ($this->sheets as $sheet) {
-            foreach ($sheet['rows'] as $row) {
-                foreach ($row as $cell) {
-                    if (is_string($cell) && !isset($strings[$cell])) {
-                        $strings[$cell] = count($strings);
-                    }
-                }
+    private function sheetXml(array $rows): string
+    {
+        $rowsXml = '';
+        foreach ($rows as $rIdx => $row) {
+            $rowNum = $rIdx + 1;
+            $cellsXml = '';
+            $cIdx = 0;
+            foreach ($row as $value) {
+                $cellRef = $this->colLetter($cIdx) . $rowNum;
+                $cellsXml .= $this->cellXml($cellRef, $value, $rIdx < $this->boldHeaderRows);
+                $cIdx++;
             }
+            $rowsXml .= '<row r="' . $rowNum . '">' . $cellsXml . '</row>';
         }
-        $this->_ss = $strings; // cache for sheet_xml usage
-
-        $si = '';
-        foreach (array_keys($strings) as $str) {
-            $si .= '<si><t xml:space="preserve">' . htmlspecialchars($str, ENT_XML1, 'UTF-8') . '</t></si>';
-        }
-        $cnt = count($strings);
-        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-             . '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
-             . ' count="' . $cnt . '" uniqueCount="' . $cnt . '">'
-             . $si
-             . '</sst>';
-    }
-
-    private array $_ss = []; // shared strings index cache
-
-    // ── xl/worksheets/sheetN.xml ─────────────────────────────────────────
-    private function sheet_xml(array $rows): string {
-        $rows_xml = '';
-        foreach ($rows as $ri => $row) {
-            $row_num  = $ri + 1;
-            $cells_xml = '';
-            foreach ($row as $ci => $val) {
-                $col_name = $this->col_name($ci);
-                $ref      = $col_name . $row_num;
-                // First row = header → bold (style 1)
-                $style = ($ri === 0) ? ' s="1"' : '';
-
-                if (is_int($val) || is_float($val)) {
-                    $cells_xml .= '<c r="' . $ref . '"' . $style . '>'
-                                . '<v>' . $val . '</v>'
-                                . '</c>';
-                } else {
-                    // String → shared strings reference
-                    $s = (string)$val;
-                    $idx = $this->_ss[$s] ?? null;
-                    if ($idx === null) {
-                        // Fallback: inline string
-                        $cells_xml .= '<c r="' . $ref . '" t="inlineStr"' . $style . '>'
-                                    . '<is><t xml:space="preserve">'
-                                    . htmlspecialchars($s, ENT_XML1, 'UTF-8')
-                                    . '</t></is></c>';
-                    } else {
-                        $cells_xml .= '<c r="' . $ref . '" t="s"' . $style . '>'
-                                    . '<v>' . $idx . '</v>'
-                                    . '</c>';
-                    }
-                }
-            }
-            $rows_xml .= '<row r="' . $row_num . '">' . $cells_xml . '</row>';
-        }
-
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
              . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-             . '<sheetData>' . $rows_xml . '</sheetData>'
+             . '<sheetData>' . $rowsXml . '</sheetData>'
              . '</worksheet>';
     }
 
-    // ── Column index → Excel letter (0→A, 25→Z, 26→AA, …) ──────────────
-    private function col_name(int $idx): string {
-        $name = '';
-        $idx++;
-        while ($idx > 0) {
-            $idx--;
-            $name = chr(65 + ($idx % 26)) . $name;
-            $idx  = intdiv($idx, 26);
+    private function cellXml(string $ref, $value, bool $bold): string
+    {
+        $styleAttr = $bold ? ' s="1"' : '';
+        if ($value === null || $value === '') {
+            return '<c r="' . $ref . '"' . $styleAttr . '/>';
         }
-        return $name;
-    }
-}
-
-// ── Generate the stats export workbook ───────────────────────────────────────
-
-/**
- * Build a stats XLSX export for a quiz.
- *
- * @param array $quiz   Full quiz row from db_get_quiz()
- * @param array $labels Translated labels (from t() calls)
- * @return string Raw XLSX binary
- */
-function build_stats_xlsx(array $quiz, array $labels): string {
-    $wb   = new XlsxWriter();
-    $q    = $quiz['questions'];
-    $s    = $quiz['stats'];
-    $n_q  = count($q);
-    $att  = $s['attempts'];
-
-    // ── Sheet 1: Summary ──
-    $avg_pct = 0;
-    if ($att > 0 && $n_q > 0) {
-        $total_correct = 0;
-        foreach ($s['questions'] as $qs) {
-            $total_correct += $qs['total_count'] > 0
-                ? $qs['correct_count'] / $qs['total_count']
-                : 0;
+        if (is_int($value) || (is_float($value) && !is_nan($value) && !is_infinite($value))) {
+            return '<c r="' . $ref . '"' . $styleAttr . '><v>' . $value . '</v></c>';
         }
-        $avg_pct = round(($total_correct / $n_q) * 100, 1);
-    }
-
-    // New v1.1 aggregates
-    $total_time   = (int)($s['total_time_seconds']       ?? 0);
-    $total_tabs   = (int)($s['total_tab_switches']       ?? 0);
-    $tab_attempts = (int)($s['attempts_with_tab_switch'] ?? 0);
-    $avg_time_sec  = ($att > 0) ? (int)round($total_time / $att) : 0;
-    $pct_with_tabs = ($att > 0) ? round($tab_attempts / $att * 100, 1) : 0;
-
-    $summary = [
-        [$labels['col.field'],        $labels['col.value']],
-        [$labels['row.title'],         $quiz['title']],
-        [$labels['row.attempts'],      $att],
-        [$labels['row.num_q'],         $n_q],
-        [$labels['row.avg_pct'],       $avg_pct],
-        [$labels['row.avg_time'],      format_duration($avg_time_sec)],
-        [$labels['row.tab_rate'],      $pct_with_tabs . '%'],
-        [$labels['row.created'],       $quiz['created_at']],
-    ];
-    $wb->add_sheet($labels['sheet.summary'], $summary);
-
-    // ── Sheet 2: Per-question stats ──
-    $q_rows = [[
-        $labels['col.nr'],
-        $labels['col.question'],
-        $labels['col.correct_ans'],
-        $labels['col.attempts'],
-        $labels['col.correct'],
-        $labels['col.pct'],
-    ]];
-    foreach ($q as $i => $question) {
-        $qs  = $s['questions'][$i] ?? ['total_count' => 0, 'correct_count' => 0];
-        $tot = $qs['total_count'];
-        $cor = $qs['correct_count'];
-        $pct = $tot > 0 ? round($cor / $tot * 100, 1) : 0;
-        $q_rows[] = [
-            $i + 1,
-            $question['text'],
-            $question['correct'],
-            $tot,
-            $cor,
-            $pct,
-        ];
-    }
-    $wb->add_sheet($labels['sheet.questions'], $q_rows);
-
-    // ── Sheet 3: Per-choice breakdown ──
-    $c_rows = [[
-        $labels['col.q_nr'],
-        $labels['col.question'],
-        $labels['col.answer'],
-        $labels['col.is_correct'],
-        $labels['col.count'],
-        $labels['col.share_pct'],
-    ]];
-    foreach ($q as $i => $question) {
-        $qs     = $s['questions'][$i] ?? ['total_count' => 0, 'choice_counts' => []];
-        $tot    = $qs['total_count'];
-        $counts = $qs['choice_counts'];
-
-        $all_choices = array_merge([$question['correct']], $question['distractors']);
-        foreach ($all_choices as $choice) {
-            $cnt  = $counts[$choice] ?? 0;
-            $pct  = $tot > 0 ? round($cnt / $tot * 100, 1) : 0;
-            $c_rows[] = [
-                $i + 1,
-                $question['text'],
-                $choice,
-                $choice === $question['correct'] ? $labels['yes'] : $labels['no'],
-                $cnt,
-                $pct,
-            ];
+        // Numerische Strings sicher als Zahl erkennen
+        if (is_string($value) && preg_match('/^-?\d+(\.\d+)?$/', $value)) {
+            return '<c r="' . $ref . '"' . $styleAttr . '><v>' . $value . '</v></c>';
         }
+        // String als inline-String (keine shared strings table)
+        $escaped = htmlspecialchars((string)$value, ENT_QUOTES | ENT_XML1, 'UTF-8');
+        // Excel erwartet xml:space="preserve" bei führenden/nachstehenden Leerzeichen
+        $preserve = (trim($escaped) !== $escaped) ? ' xml:space="preserve"' : '';
+        return '<c r="' . $ref . '"' . $styleAttr . ' t="inlineStr"><is><t' . $preserve . '>' . $escaped . '</t></is></c>';
     }
-    $wb->add_sheet($labels['sheet.choices'], $c_rows);
 
-    return $wb->build();
-}
-
-/**
- * Build a stats CSV export (single flat table: question × choice).
- *
- * @param array $quiz   Full quiz row
- * @param array $labels Translated labels
- * @return string UTF-8 CSV with BOM
- */
-function build_stats_csv(array $quiz, array $labels): string {
-    $q   = $quiz['questions'];
-    $s   = $quiz['stats'];
-    $att = (int)($s['attempts'] ?? 0);
-    $n_q = count($q);
-
-    // v1.1 aggregates
-    $total_time   = (int)($s['total_time_seconds']       ?? 0);
-    $tab_attempts = (int)($s['attempts_with_tab_switch'] ?? 0);
-    $avg_time_sec = ($att > 0) ? (int)round($total_time / $att) : 0;
-    $pct_with_tabs = ($att > 0) ? round($tab_attempts / $att * 100, 1) : 0;
-
-    // Average correct %
-    $avg_pct = 0;
-    if ($att > 0 && $n_q > 0) {
-        $sum = 0;
-        foreach ($s['questions'] as $qs) {
-            $sum += ($qs['total_count'] ?? 0) > 0
-                ? ($qs['correct_count'] ?? 0) / $qs['total_count']
-                : 0;
+    private function colLetter(int $idx): string
+    {
+        // 0 -> A, 25 -> Z, 26 -> AA, ...
+        $letters = '';
+        $n = $idx;
+        while (true) {
+            $letters = chr(65 + ($n % 26)) . $letters;
+            $n = intdiv($n, 26) - 1;
+            if ($n < 0) break;
         }
-        $avg_pct = round(($sum / $n_q) * 100, 1);
+        return $letters;
     }
-
-    $out = '';
-    // CSV row helper — semicolon delimiter (European locale)
-    $row = function (array $fields) use (&$out) {
-        $escaped = array_map(function ($v) {
-            $v = (string)$v;
-            if (str_contains($v, '"') || str_contains($v, ';') || str_contains($v, "\n") || str_contains($v, "\r")) {
-                $v = '"' . str_replace('"', '""', $v) . '"';
-            }
-            return $v;
-        }, $fields);
-        $out .= implode(';', $escaped) . "\r\n";
-    };
-
-    // ── Section 1: Summary ──
-    $out .= '# ' . $labels['sheet.summary'] . "\r\n";
-    $row([$labels['col.field'],     $labels['col.value']]);
-    $row([$labels['row.title'],      $quiz['title']]);
-    $row([$labels['row.attempts'],   $att]);
-    $row([$labels['row.num_q'],      $n_q]);
-    $row([$labels['row.avg_pct'],    $avg_pct]);
-    $row([$labels['row.avg_time'],   format_duration($avg_time_sec)]);
-    $row([$labels['row.tab_rate'],   $pct_with_tabs . '%']);
-    $row([$labels['row.created'],    $quiz['created_at']]);
-    $out .= "\r\n";
-
-    // ── Section 2: Per-question stats ──
-    $out .= '# ' . $labels['sheet.questions'] . "\r\n";
-    $row([
-        $labels['col.nr'],
-        $labels['col.question'],
-        $labels['col.correct_ans'],
-        $labels['col.attempts'],
-        $labels['col.correct'],
-        $labels['col.pct'],
-    ]);
-    foreach ($q as $i => $question) {
-        $qs  = $s['questions'][$i] ?? ['total_count' => 0, 'correct_count' => 0];
-        $tot = (int)($qs['total_count']   ?? 0);
-        $cor = (int)($qs['correct_count'] ?? 0);
-        $pct = $tot > 0 ? round($cor / $tot * 100, 1) : 0;
-        $row([$i + 1, $question['text'], $question['correct'], $tot, $cor, $pct]);
-    }
-    $out .= "\r\n";
-
-    // ── Section 3: Answer options ──
-    $out .= '# ' . $labels['sheet.choices'] . "\r\n";
-    $row([
-        $labels['col.q_nr'],
-        $labels['col.question'],
-        $labels['col.answer'],
-        $labels['col.is_correct'],
-        $labels['col.count'],
-        $labels['col.share_pct'],
-    ]);
-    foreach ($q as $i => $question) {
-        $qs     = $s['questions'][$i] ?? ['total_count' => 0, 'choice_counts' => []];
-        $tot    = (int)($qs['total_count'] ?? 0);
-        $counts = $qs['choice_counts'] ?? [];
-        $all_choices = array_merge([$question['correct']], $question['distractors']);
-        foreach ($all_choices as $choice) {
-            $cnt = (int)($counts[$choice] ?? 0);
-            $pct = $tot > 0 ? round($cnt / $tot * 100, 1) : 0;
-            $row([
-                $i + 1,
-                $question['text'],
-                $choice,
-                $choice === $question['correct'] ? $labels['yes'] : $labels['no'],
-                $cnt,
-                $pct,
-            ]);
-        }
-    }
-
-    return "\xEF\xBB\xBF" . $out; // UTF-8 BOM for Excel compatibility
 }

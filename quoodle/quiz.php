@@ -1,140 +1,112 @@
 <?php
-declare(strict_types=1);
+require __DIR__ . '/lib/storage.php';
 
-require_once __DIR__ . '/lib/helpers.php';
-require_once __DIR__ . '/lib/i18n.php';
-require_once __DIR__ . '/lib/db.php';
-require_once __DIR__ . '/layout.php';
-
-$lang = i18n_init();
-$base = get_base_url();
-
-// ── Validate quiz ID ─────────────────────────────────────────────────────────
 $id = $_GET['id'] ?? '';
-if (!validate_id($id)) {
-    not_found();
-}
+$quiz = load_quiz($id);
 
-$quiz = db_get_quiz($id);
 if (!$quiz) {
-    not_found();
+    http_response_code(404);
+    $page_title = t('not_found');
+    require __DIR__ . '/lib/header.php';
+    echo '<div class="card"><div class="alert error">' . htmlspecialchars(t('quiz_invalid')) . '</div></div>';
+    require __DIR__ . '/lib/footer.php';
+    exit;
 }
 
-$questions = $quiz['questions'];
-$n         = count($questions);
-
-// ── Shuffle answer choices server-side ──────────────────────────────────────
-$shuffled = [];
-foreach ($questions as $q) {
-    $choices = array_merge([$q['correct']], $q['distractors']);
-    shuffle($choices);
-    $shuffled[] = $choices;
-}
-
-// ── Build JS data: correct answers + explanations per question ──────────────
-$js_correct = [];
-$js_expl    = [];
-foreach ($questions as $qi => $q) {
-    $js_correct[$qi] = $q['correct'];
-    $js_expl[$qi]    = $q['explanation'] ?? '';
-}
-// JSON_HEX_* escapes characters that could break out of <script>
-$json_flags = JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP;
-
-render_header(e($quiz['title']), $lang);
+$page_title = $quiz['title'];
+$base = rtrim(dirname($_SERVER['SCRIPT_NAME']), '/\\');
+$total = count($quiz['questions']);
+require __DIR__ . '/lib/header.php';
 ?>
 
-  <h1 class="page-title"><?= e($quiz['title']) ?></h1>
+<div class="card">
+  <h2><?= htmlspecialchars($quiz['title']) ?></h2>
+  <p class="subtitle"><?= $total ?> <?= tp('questions_count', $total) ?>. <?= t('quiz_intro') ?></p>
 
-  <!-- Progress (visible once JS activates stepper) -->
-  <div class="quiz-progress" id="progressText"
-       data-template="<?= e(sprintf(t('quiz.question_of'), '{0}', '{1}')) ?>">
-    <?= e(sprintf(t('quiz.question_of'), 1, $n)) ?>
-  </div>
-  <div class="progress-bar" id="progressBar">
-    <div class="progress-fill" id="progressFill" style="width:<?= round(1/$n*100) ?>%"></div>
-  </div>
+  <form id="quiz-form" action="<?= htmlspecialchars($base) ?>/submit.php" method="post" autocomplete="off">
+    <input type="hidden" name="id" value="<?= htmlspecialchars($id) ?>">
 
-  <div class="card">
-    <form id="quiz-form" method="post" action="<?= e($base) ?>/submit.php" novalidate>
-      <input type="hidden" name="quiz_id"       value="<?= e($id) ?>">
-      <input type="hidden" name="lang"          value="<?= e($lang) ?>">
-      <input type="hidden" name="elapsed_time"  id="elapsedTime"  value="0">
-      <input type="hidden" name="tab_switches"  id="tabSwitches"  value="0">
+    <div class="quiz-progress">
+      <span id="prog-text"><?= t('question_n') ?> 1 <?= t('q_of') ?> <?= $total ?></span>
+      <div class="progress-bar-wrap"><span id="prog-bar" style="width: <?= round(100/$total, 1) ?>%;"></span></div>
+    </div>
 
-      <?php foreach ($questions as $qi => $q): ?>
-      <div class="quiz-step<?= $qi === 0 ? ' active' : '' ?>" data-step="<?= $qi ?>">
-        <p style="font-size:.8125rem;color:var(--text-muted);margin-bottom:6px">
-          <?= e(sprintf(t('quiz.question_of'), $qi + 1, $n)) ?>
-        </p>
-        <p style="font-size:1.0625rem;font-weight:600;margin-bottom:16px"><?= e($q['text']) ?></p>
+    <div id="quiz-alert" class="quiz-alert"><?= t('please_select') ?></div>
 
-        <ul class="choices" role="radiogroup">
-          <?php foreach ($shuffled[$qi] as $choice): ?>
-          <li>
-            <label class="choice-label">
-              <input class="choice-radio" type="radio"
-                     name="answers[<?= $qi ?>]"
-                     value="<?= e($choice) ?>">
-              <span><?= e($choice) ?></span>
-              <span class="choice-mark" aria-hidden="true"></span>
+    <?php foreach ($quiz['questions'] as $qi => $q):
+        $choices = array_merge([$q['correct']], $q['distractors']);
+        shuffle($choices);
+    ?>
+      <div class="question" data-qi="<?= $qi ?>">
+        <div class="qnum"><?= t('question_n') ?> <?= $qi + 1 ?></div>
+        <div class="qtext"><?= nl2br(htmlspecialchars($q['question'])) ?></div>
+        <div class="choices">
+          <?php foreach ($choices as $choice): ?>
+            <label>
+              <input type="radio" name="answers[<?= $qi ?>]" value="<?= htmlspecialchars($choice) ?>">
+              <span><?= htmlspecialchars($choice) ?></span>
             </label>
-          </li>
           <?php endforeach; ?>
-        </ul>
-
-        <!-- Inline explanation (revealed on answer) -->
-        <div class="explanation-block quiz-inline-expl" style="display:none">
-          <div class="explanation-label"><?= e(t('feedback.explanation')) ?></div>
-          <div class="quiz-inline-expl-text"></div>
         </div>
       </div>
-      <?php endforeach; ?>
+    <?php endforeach; ?>
 
-      <!-- Validation message (shown if user tries to advance without answering) -->
-      <p class="validation-msg" id="validationMsg" role="alert">
-        <?= e(t('quiz.err.no_answer')) ?>
-      </p>
-
-      <!-- Stepper navigation -->
-      <div class="step-nav" id="stepNav">
-        <button type="button" class="btn btn-ghost" id="stepPrev" style="display:none">
-          ← <?= e(t('quiz.prev')) ?>
-        </button>
-        <button type="button" class="btn btn-primary" id="stepNext" disabled>
-          <?= e(t('quiz.next')) ?> →
-        </button>
-        <button type="submit" class="btn btn-primary" id="stepSubmit" style="display:none" disabled>
-          <?= e(t('quiz.submit')) ?>
-        </button>
-      </div>
-
-      <!-- No-JS fallback -->
-      <noscript>
-        <style>
-          .quiz-step { display: block !important; }
-          #stepNav, .quiz-inline-expl, .choice-mark, #progressBar, #progressText { display: none !important; }
-        </style>
-        <div style="margin-top:24px">
-          <button type="submit" class="btn btn-primary"><?= e(t('quiz.submit')) ?></button>
-        </div>
-      </noscript>
-
-    </form>
-  </div>
+    <div class="quiz-nav">
+      <button type="button" id="btn-prev" class="btn ghost" onclick="stepQuiz(-1)"><?= t('prev') ?></button>
+      <button type="button" id="btn-next" class="btn" onclick="stepQuiz(1)"><?= t('next') ?></button>
+      <button type="submit" id="btn-submit" class="btn" style="display:none;"><?= t('submit_answers') ?></button>
+    </div>
+  </form>
+</div>
 
 <script>
-// Expose quiz data for app.js to consume
-window.__QUOODLE = {
-  correct:      <?= json_encode($js_correct, $json_flags) ?>,
-  explanations: <?= json_encode($js_expl,    $json_flags) ?>,
-  labels: {
-    wait:      <?= json_encode(t('quiz.wait_seconds'),   $json_flags) ?>,
-    next:      <?= json_encode(t('quiz.next'),           $json_flags) ?>,
-    submit:    <?= json_encode(t('quiz.submit'),         $json_flags) ?>
+(function(){
+  var qs = document.querySelectorAll('.question');
+  var total = qs.length;
+  var cur = 0;
+  var alertEl = document.getElementById('quiz-alert');
+
+  function show(i){
+    qs.forEach(function(q,idx){ q.classList.toggle('active', idx===i); });
+    document.getElementById('prog-text').textContent =
+      <?= json_encode(t('question_n')) ?> + ' ' + (i+1) + ' ' + <?= json_encode(t('q_of')) ?> + ' ' + total;
+    document.getElementById('prog-bar').style.width = ((i+1)/total*100) + '%';
+    document.getElementById('btn-prev').style.display = i===0 ? 'none' : '';
+    document.getElementById('btn-next').style.display = i===total-1 ? 'none' : '';
+    document.getElementById('btn-submit').style.display = i===total-1 ? '' : 'none';
+    alertEl.style.display = 'none';
+    // Scroll to top of card
+    qs[0].closest('.card').scrollIntoView({behavior:'smooth', block:'start'});
   }
-};
+
+  window.stepQuiz = function(dir){
+    if(dir===1){
+      // Check if current question has a selected answer
+      var radios = qs[cur].querySelectorAll('input[type=radio]');
+      var answered = false;
+      radios.forEach(function(r){ if(r.checked) answered = true; });
+      if(!answered){
+        alertEl.style.display = 'block';
+        return;
+      }
+    }
+    cur = Math.max(0, Math.min(total-1, cur+dir));
+    show(cur);
+  };
+
+  // Handle form submission: check last question
+  document.getElementById('quiz-form').addEventListener('submit', function(e){
+    var radios = qs[cur].querySelectorAll('input[type=radio]');
+    var answered = false;
+    radios.forEach(function(r){ if(r.checked) answered = true; });
+    if(!answered){
+      e.preventDefault();
+      alertEl.style.display = 'block';
+    }
+  });
+
+  show(0);
+})();
 </script>
 
-<?php
-render_footer();
+<?php require __DIR__ . '/lib/footer.php'; ?>

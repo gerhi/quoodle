@@ -1,100 +1,83 @@
 <?php
-declare(strict_types=1);
+require __DIR__ . '/lib/storage.php';
+require __DIR__ . '/lib/qrcode.php';
 
-require_once __DIR__ . '/lib/helpers.php';
-require_once __DIR__ . '/lib/i18n.php';
-require_once __DIR__ . '/lib/db.php';
-require_once __DIR__ . '/lib/qr.php';
-require_once __DIR__ . '/layout.php';
-
-$lang = i18n_init();
-$base = get_base_url();
-
-// ── Validate params ──────────────────────────────────────────────────────────
 $id    = $_GET['id'] ?? '';
 $token = $_GET['t']  ?? '';
+$quiz  = load_quiz($id);
 
-if (!validate_id($id) || !validate_token($token)) {
-    not_found();
+if (!$quiz || !verify_teacher_token($quiz, $token)) {
+    http_response_code(404);
+    $page_title = t('not_found');
+    require __DIR__ . '/lib/header.php';
+    echo '<div class="card"><div class="alert error">' . htmlspecialchars(t('share_invalid')) . '</div></div>';
+    require __DIR__ . '/lib/footer.php';
+    exit;
 }
 
-$quiz = db_get_quiz($id);
-if (!$quiz || !safe_token_compare($quiz['teacher_token'], $token)) {
-    not_found();
-}
+$page_title = $quiz['title'] . ' — Links';
+$studentUrl = quiz_url($id);
+$teacherUrl = teacher_stats_url($id, $token);
+$qrStudentSvg = QRCode::svg($studentUrl, 240);
+$qrTeacherSvg = QRCode::svg($teacherUrl, 180);
+$qCount = count($quiz['questions']);
 
-// ── Build URLs ───────────────────────────────────────────────────────────────
-$student_url = $base . '/quiz.php?id=' . urlencode($id);
-$teacher_url = $base . '/stats.php?id=' . urlencode($id) . '&t=' . urlencode($token);
-
-// ── Generate QR codes ────────────────────────────────────────────────────────
-try {
-    $student_qr = QrCode::generate($student_url, 220);
-    $teacher_qr = QrCode::generate($teacher_url, 220);
-} catch (Throwable $e) {
-    $student_qr = '';
-    $teacher_qr = '';
-}
-
-$n = count($quiz['questions']);
-$n_label = $n . ' ' . ($n === 1 ? t('stats.question') : t('stats.question') . 'en');
-
-render_header(t('share.headline') . ': ' . $quiz['title'], $lang);
+require __DIR__ . '/lib/header.php';
 ?>
 
-  <div class="page-title">
-    <h1><?= e(t('share.headline')) ?></h1>
-    <p class="page-subtitle"><?= e($quiz['title']) ?> &middot; <?= e($n_label) ?></p>
+<div class="card">
+  <div class="alert success">
+    <strong><?= t('quiz_created') ?></strong> <?= t('share_bookmark') ?>
   </div>
 
-  <!-- Student link -->
-  <div class="card">
-    <h2 class="card-title"><?= e(t('share.student.title')) ?></h2>
-    <p class="card-subtitle"><?= e(t('share.student.desc')) ?></p>
+  <h2><?= htmlspecialchars($quiz['title']) ?></h2>
+  <p class="subtitle"><?= $qCount ?> <?= tp('questions_count', $qCount) ?></p>
 
+  <?php
+  $expiresAt = $quiz['expires_at'] ?? null;
+  if ($expiresAt):
+      $expDate = date(current_lang() === 'de' ? 'd.m.Y' : 'M j, Y', strtotime($expiresAt));
+  ?>
+    <p class="hint" style="margin-bottom:18px;">⏱ <?= sprintf(t('share_expires_note'), $expDate) ?></p>
+  <?php endif; ?>
+
+  <div class="share-block">
+    <div class="label-row">
+      <h3><?= t('for_students') ?></h3>
+      <span class="pill student"><?= t('public') ?></span>
+    </div>
+    <p class="hint" style="margin:0 0 6px;"><?= t('share_student_hint') ?></p>
+    <div class="share-link">
+      <input type="text" id="link-student" value="<?= htmlspecialchars($studentUrl) ?>" readonly onclick="this.select();">
+      <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('link-student').value);this.textContent=<?= json_encode(t('copied')) ?>;setTimeout(()=>this.textContent=<?= json_encode(t('copy')) ?>,1500);"><?= t('copy') ?></button>
+    </div>
     <div class="qr-wrap">
-      <?= $student_qr ?>
+      <?= $qrStudentSvg ?>
+      <div class="hint"><?= t('qr_scan_hint') ?></div>
     </div>
-
-    <div class="url-row">
-      <span class="url-display" id="student-url"><?= e($student_url) ?></span>
-      <button class="btn btn-secondary btn-sm"
-              data-copy="#student-url"
-              data-copied-label="<?= e(t('share.copied')) ?>"
-      ><?= e(t('share.copy')) ?></button>
+    <div class="button-row">
+      <a class="btn" href="<?= htmlspecialchars($studentUrl) ?>" target="_blank"><?= t('preview_quiz') ?></a>
     </div>
-
-    <a href="<?= e($student_url . '&lang=' . urlencode($lang)) ?>"
-       class="btn btn-secondary mt-8" target="_blank" rel="noopener"
-    ><?= e(t('share.student.preview')) ?> ↗</a>
   </div>
 
-  <!-- Teacher link -->
-  <div class="card">
-    <h2 class="card-title"><?= e(t('share.teacher.title')) ?></h2>
-    <p class="card-subtitle"><?= e(t('share.teacher.desc')) ?></p>
-
-    <div class="qr-wrap">
-      <?= $teacher_qr ?>
+  <div class="share-block">
+    <div class="label-row">
+      <h3><?= t('for_teacher') ?></h3>
+      <span class="pill teacher"><?= t('keep_secret') ?></span>
     </div>
-
-    <div class="url-row">
-      <span class="url-display" id="teacher-url"><?= e($teacher_url) ?></span>
-      <button class="btn btn-secondary btn-sm"
-              data-copy="#teacher-url"
-              data-copied-label="<?= e(t('share.copied')) ?>"
-      ><?= e(t('share.copy')) ?></button>
+    <p class="hint" style="margin:0 0 6px;"><?= t('teacher_hint') ?></p>
+    <div class="share-link">
+      <input type="text" id="link-teacher" value="<?= htmlspecialchars($teacherUrl) ?>" readonly onclick="this.select();">
+      <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('link-teacher').value);this.textContent=<?= json_encode(t('copied')) ?>;setTimeout(()=>this.textContent=<?= json_encode(t('copy')) ?>,1500);"><?= t('copy') ?></button>
     </div>
-
-    <div class="warning-box mt-8">
-      ⚠ <?= e(t('share.teacher.warning')) ?>
+    <div class="qr-wrap" style="background:#fffbeb; border-color:#fde68a;">
+      <?= $qrTeacherSvg ?>
+      <div class="hint"><?= t('qr_teacher_hint') ?></div>
     </div>
-
-    <a href="<?= e($teacher_url . '&lang=' . urlencode($lang)) ?>"
-       class="btn btn-primary mt-8"
-    ><?= e(t('share.teacher.open')) ?> →</a>
+    <div class="button-row">
+      <a class="btn" href="<?= htmlspecialchars($teacherUrl) ?>" target="_blank"><?= t('open_results') ?></a>
+    </div>
   </div>
+</div>
 
-
-<?php
-render_footer();
+<?php require __DIR__ . '/lib/footer.php'; ?>

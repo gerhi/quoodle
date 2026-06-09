@@ -1,174 +1,257 @@
 <?php
-declare(strict_types=1);
+require __DIR__ . '/lib/storage.php';
 
-require_once __DIR__ . '/lib/helpers.php';
-require_once __DIR__ . '/lib/i18n.php';
-require_once __DIR__ . '/lib/db.php';
-require_once __DIR__ . '/layout.php';
+$id    = $_GET['id'] ?? $_POST['id'] ?? '';
+$token = $_GET['t']  ?? $_POST['t']  ?? '';
+$quiz  = load_quiz($id);
 
-$lang = i18n_init();
-$base = get_base_url();
-
-// ── Validate params + auth ───────────────────────────────────────────────────
-$id    = $_GET['id'] ?? '';
-$token = $_GET['t']  ?? '';
-
-if (!validate_id($id) || !validate_token($token)) {
-    not_found();
+if (!$quiz || !verify_teacher_token($quiz, $token)) {
+    http_response_code(404);
+    $page_title = t('not_found');
+    require __DIR__ . '/lib/header.php';
+    echo '<div class="card"><div class="alert error">' . htmlspecialchars(t('stats_invalid')) . '</div></div>';
+    require __DIR__ . '/lib/footer.php';
+    exit;
 }
 
-$quiz = db_get_quiz($id);
-if (!$quiz || !safe_token_compare($quiz['teacher_token'], $token)) {
-    not_found();
-}
+// ---- Handle POST actions ----
+$flash = null;
 
-$questions = $quiz['questions'];
-$stats     = $quiz['stats'];
-$n_q       = count($questions);
-$attempts  = (int)($stats['attempts'] ?? 0);
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
 
-// ── New v1.1 aggregates (defensive defaults for pre-existing quizzes) ────────
-$total_time   = (int)($stats['total_time_seconds']       ?? 0);
-$total_tabs   = (int)($stats['total_tab_switches']       ?? 0);
-$tab_attempts = (int)($stats['attempts_with_tab_switch'] ?? 0);
-
-$avg_time_sec  = ($attempts > 0) ? (int)round($total_time / $attempts) : 0;
-$avg_tabs      = ($attempts > 0) ? round($total_tabs / $attempts, 1)   : 0.0;
-$pct_with_tabs = ($attempts > 0) ? round($tab_attempts / $attempts * 100) : 0;
-
-// ── Average correct % ────────────────────────────────────────────────────────
-$avg_pct = 0;
-if ($attempts > 0 && $n_q > 0) {
-    $sum = 0;
-    foreach ($stats['questions'] as $qs) {
-        $tot = $qs['total_count'] ?? 0;
-        $cor = $qs['correct_count'] ?? 0;
-        $sum += $tot > 0 ? $cor / $tot : 0;
+    if ($action === 'delete') {
+        delete_quiz($id);
+        // Redirect to landing page with flash
+        $base = base_path();
+        header('Location: ' . $base . '/index.php?deleted=1');
+        exit;
     }
-    $avg_pct = round(($sum / $n_q) * 100);
+
+    if ($action === 'set_expiry') {
+        $mode = $_POST['mode'] ?? '';
+        $newExpiry = null;
+        switch ($mode) {
+            case '+1m':  $newExpiry = date('c', strtotime('+30 days'));  break;
+            case '+3m':  $newExpiry = date('c', strtotime('+90 days'));  break;
+            case '+1y':  $newExpiry = date('c', strtotime('+365 days')); break;
+            case 'never': $newExpiry = null; break;
+            case 'date':
+                $d = $_POST['expiry_date'] ?? '';
+                if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $d)) {
+                    $newExpiry = date('c', strtotime($d . ' 23:59:59'));
+                }
+                break;
+        }
+        update_expiry($id, $newExpiry);
+        // Reload quiz to get updated data
+        $quiz = load_quiz($id);
+        if (!$quiz) { header('Location: index.php'); exit; }
+        $flash = 'expiry_updated';
+    }
 }
 
-$student_url = $base . '/quiz.php?id=' . urlencode($id);
-$export_base = $base . '/export.php?id=' . urlencode($id) . '&t=' . urlencode($token);
+// ---- Prepare display data ----
+$page_title      = $quiz['title'];
+$container_class = 'container wide';
 
-render_header(t('stats.headline') . ': ' . $quiz['title'], $lang);
+$stats     = $quiz['stats'] ?? ['attempts' => 0, 'questions' => []];
+$attempts  = (int)($stats['attempts'] ?? 0);
+$qStats    = $stats['questions'] ?? [];
+
+$totalAnswered = 0; $totalCorrect = 0;
+foreach ($qStats as $q) {
+    $totalAnswered += (int)($q['total_count']   ?? 0);
+    $totalCorrect  += (int)($q['correct_count'] ?? 0);
+}
+$avgPct = $totalAnswered > 0 ? round(100 * $totalCorrect / $totalAnswered) : null;
+$qCount = count($quiz['questions']);
+
+// Expiry helpers
+$expiresAt = $quiz['expires_at'] ?? null;
+$expiryDisplay = null;
+$expiryClass = '';
+$expiryCountdown = '';
+if ($expiresAt !== null) {
+    $expTs = strtotime($expiresAt);
+    $daysLeft = (int)ceil(($expTs - time()) / 86400);
+    $expiryDisplay = date(current_lang() === 'de' ? 'd.m.Y' : 'M j, Y', $expTs);
+    if ($daysLeft < 0) {
+        $expiryCountdown = t('expired');
+        $expiryClass = 'danger';
+    } elseif ($daysLeft === 0) {
+        $expiryCountdown = t('expires_today');
+        $expiryClass = 'danger';
+    } elseif ($daysLeft <= 3) {
+        $expiryCountdown = t('expires_in') . ' ' . $daysLeft . ' ' . tp('expires_days', $daysLeft);
+        $expiryClass = 'danger';
+    } elseif ($daysLeft <= 14) {
+        $expiryCountdown = t('expires_in') . ' ' . $daysLeft . ' ' . tp('expires_days', $daysLeft);
+        $expiryClass = 'warning';
+    } else {
+        $expiryCountdown = t('expires_in') . ' ' . $daysLeft . ' ' . tp('expires_days', $daysLeft);
+        $expiryClass = 'ok';
+    }
+}
+
+function pct_class(int $pct): string {
+    if ($pct >= 75) return 'high';
+    if ($pct >= 50) return 'mid';
+    return 'low';
+}
+
+require __DIR__ . '/lib/header.php';
 ?>
 
+<?php if ($flash === 'expiry_updated'): ?>
+  <div class="alert success" style="margin-bottom:20px;"><?= t('expiry_updated') ?></div>
+<?php endif; ?>
 
+<div class="card">
+  <h2 style="margin-bottom:4px;"><?= htmlspecialchars($quiz['title']) ?></h2>
+  <p class="subtitle"><?= t('stats_subtitle') ?></p>
 
-    <h1 class="page-title"><?= e($quiz['title']) ?></h1>
-    <p class="page-subtitle">
-      <?= e(t('stats.created')) ?>: <?= e(date('d.m.Y', strtotime($quiz['created_at']))) ?>
-    </p>
-
-    <!-- Summary cards -->
-    <div class="summary-cards">
-      <div class="summary-card">
-        <div class="summary-card-value"><?= $attempts ?></div>
-        <div class="summary-card-label"><?= e(t('stats.total_attempts')) ?></div>
+  <div class="stat-summary">
+    <div class="stat-card">
+      <div class="num"><?= $attempts ?></div>
+      <div class="lbl"><?= tp('attempts', $attempts) ?></div>
+    </div>
+    <div class="stat-card">
+      <div class="num"><?= $qCount ?></div>
+      <div class="lbl"><?= tp('questions_count', $qCount) ?></div>
+    </div>
+    <div class="stat-card">
+      <div class="num"><?= $avgPct === null ? '—' : $avgPct . '&nbsp;%' ?></div>
+      <div class="lbl"><?= t('avg_correct') ?></div>
+    </div>
+    <div class="stat-card expiry-card <?= $expiryClass ?>">
+      <div class="num" style="font-size:1.1rem;">
+        <?= $expiresAt ? htmlspecialchars($expiryDisplay) : t('no_expiry') ?>
       </div>
-      <div class="summary-card">
-        <div class="summary-card-value"><?= $n_q ?></div>
-        <div class="summary-card-label"><?= e(t('stats.num_questions')) ?></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-card-value"><?= $attempts > 0 ? $avg_pct . '%' : '—' ?></div>
-        <div class="summary-card-label"><?= e(t('stats.avg_correct')) ?></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-card-value"><?= $attempts > 0 && $avg_time_sec > 0 ? e(format_duration($avg_time_sec)) : '—' ?></div>
-        <div class="summary-card-label"><?= e(t('stats.avg_time')) ?></div>
-      </div>
-      <div class="summary-card">
-        <div class="summary-card-value">
-          <?php if ($attempts === 0): ?>—<?php
-            elseif ($tab_attempts === 0): ?>0<?php
-            else: ?><?= $pct_with_tabs ?>%<?php
-          endif; ?>
-        </div>
-        <div class="summary-card-label"><?= e(t('stats.tab_switches_rate')) ?></div>
+      <div class="lbl">
+        <?= t('expiry_label') ?>
+        <?php if ($expiryCountdown): ?> — <span class="expiry-countdown <?= $expiryClass ?>"><?= $expiryCountdown ?></span><?php endif; ?>
       </div>
     </div>
+  </div>
+</div>
 
-    <!-- Action buttons -->
-    <div class="stats-actions">
-      <a href="<?= e('?id=' . urlencode($id) . '&t=' . urlencode($token) . '&lang=' . urlencode($lang)) ?>"
-         class="btn btn-secondary btn-sm">↻ <?= e(t('stats.refresh')) ?></a>
-      <a href="<?= e($student_url . '&lang=' . urlencode($lang)) ?>"
-         class="btn btn-secondary btn-sm" target="_blank" rel="noopener">
-        <?= e(t('stats.open_quiz')) ?> ↗</a>
-      <?php if ($attempts > 0): ?>
-      <a href="<?= e($export_base . '&format=xlsx&lang=' . urlencode($lang)) ?>"
-         class="btn btn-secondary btn-sm">📊 <?= e(t('stats.export_xlsx')) ?></a>
-      <a href="<?= e($export_base . '&format=csv&lang=' . urlencode($lang)) ?>"
-         class="btn btn-secondary btn-sm">📄 <?= e(t('stats.export_csv')) ?></a>
-      <?php endif; ?>
+<div class="card">
+  <h2 style="margin-bottom:4px;"><?= t('per_question') ?></h2>
+  <p class="subtitle"><?= t('per_question_sub') ?></p>
+
+  <?php if ($attempts === 0): ?>
+    <div class="empty-state">
+      <span class="icon">📭</span>
+      <div><?= t('no_attempts_yet') ?></div>
+      <div style="margin-top:6px; font-size:0.9rem;"><?= t('no_attempts_hint') ?></div>
     </div>
-
-    <?php if ($attempts === 0): ?>
-    <!-- Empty state -->
-    <div class="card" style="text-align:center;padding:48px 32px">
-      <div style="font-size:2.5rem;margin-bottom:12px">📊</div>
-      <h2 class="card-title"><?= e(t('stats.no_attempts')) ?></h2>
-      <p class="card-subtitle"><?= e(t('stats.no_attempts_sub')) ?></p>
-    </div>
-
-    <?php else: ?>
-    <!-- Per-question breakdown -->
-    <?php foreach ($questions as $qi => $q): ?>
-    <?php
-      $qs  = $stats['questions'][$qi] ?? ['total_count'=>0,'correct_count'=>0,'choice_counts'=>[]];
-      $tot = (int)($qs['total_count']   ?? 0);
-      $cor = (int)($qs['correct_count'] ?? 0);
-      $pct = $tot > 0 ? round($cor / $tot * 100) : 0;
-      $bar_mod = $pct >= 75 ? 'stat-bar--green' : ($pct >= 50 ? 'stat-bar--amber' : 'stat-bar--red');
-
-      $choice_counts = $qs['choice_counts'] ?? [];
-      $known = array_merge([$q['correct']], $q['distractors']);
-      $unknowns = array_diff(array_keys($choice_counts), $known);
-      $max_cnt = max(1, ...array_merge(array_values($choice_counts), [0]));
+  <?php else: ?>
+    <?php foreach ($quiz['questions'] as $qi => $q):
+        $qs = $qStats[$qi] ?? ['correct_count'=>0,'total_count'=>0,'choice_counts'=>[]];
+        $tot = (int)$qs['total_count']; $cor = (int)$qs['correct_count'];
+        $pct = $tot > 0 ? (int)round(100*$cor/$tot) : 0;
+        $cls = pct_class($pct);
+        $choices = array_merge([$q['correct']], $q['distractors']); sort($choices);
+        $counts = (array)($qs['choice_counts'] ?? []);
     ?>
-    <div class="card stat-question">
-      <div class="stat-qhead">
-        <span class="stat-qnum"><?= e(t('stats.question')) ?> <?= $qi + 1 ?></span>
-        <strong><?= e($q['text']) ?></strong>
-        <span class="stat-fraction"><?= $cor ?>/<?= $tot ?> · <?= $pct ?>%</span>
-      </div>
-
-      <div class="stat-bar-wrap">
-        <div class="stat-bar <?= $bar_mod ?>" style="width:<?= $pct ?>%"></div>
-      </div>
-
-      <ul class="choice-breakdown">
-        <?php foreach ($known as $choice): ?>
-        <?php
-          $cnt       = (int)($choice_counts[$choice] ?? 0);
-          $share     = $tot > 0 ? round($cnt / $tot * 100) : 0;
-          $bar_w     = $max_cnt > 0 ? round($cnt / $max_cnt * 100) : 0;
-          $is_correct= ($choice === $q['correct']);
+      <div class="stat-question">
+        <div class="stat-head">
+          <div>
+            <div class="qnum"><?= t('question_n') ?> <?= $qi+1 ?></div>
+            <div class="qtext" style="margin-bottom:0;"><?= nl2br(htmlspecialchars($q['question'])) ?></div>
+          </div>
+          <div class="pct <?= $cls ?>"><?= $cor ?>/<?= $tot ?> · <?= $pct ?>&nbsp;%</div>
+        </div>
+        <div class="bar <?= $cls ?>"><span style="width:<?= $pct ?>%;"></span></div>
+        <?php foreach ($choices as $choice):
+            $cnt = (int)($counts[$choice] ?? 0);
+            $share = $tot > 0 ? (int)round(100*$cnt/$tot) : 0;
+            $isCorrect = ($choice === $q['correct']);
         ?>
-        <li class="cb-row <?= $is_correct ? 'cb-row--correct' : '' ?>">
-          <span class="cb-marker"><?= $is_correct ? '✓' : '' ?></span>
-          <span class="cb-text"><?= e($choice) ?></span>
-          <div class="cb-bar-wrap"><div class="cb-bar" style="width:<?= $bar_w ?>%"></div></div>
-          <span class="cb-count"><?= $cnt ?> · <?= $share ?>%</span>
-        </li>
+          <div class="choice-stat <?= $isCorrect ? 'is-correct' : '' ?>">
+            <div class="marker"><?= $isCorrect ? '✓' : '' ?></div>
+            <div class="text"><?= htmlspecialchars($choice) ?></div>
+            <div class="mini-bar"><span style="width:<?= $share ?>%;"></span></div>
+            <div class="count"><?= $cnt ?> · <?= $share ?>&nbsp;%</div>
+          </div>
         <?php endforeach; ?>
-        <?php foreach ($unknowns as $unk): ?>
-        <?php $cnt = (int)($choice_counts[$unk] ?? 0); $share = $tot > 0 ? round($cnt/$tot*100) : 0; ?>
-        <li class="cb-row">
-          <span class="cb-marker cb-marker--unknown">?</span>
-          <span class="cb-text"><?= e($unk) ?> <em class="text-muted">(unknown answer)</em></span>
-          <div class="cb-bar-wrap"><div class="cb-bar" style="width:<?= $max_cnt > 0 ? round($cnt/$max_cnt*100) : 0 ?>%"></div></div>
-          <span class="cb-count"><?= $cnt ?> · <?= $share ?>%</span>
-        </li>
+        <?php $allKnown = array_flip($choices);
+          foreach ($counts as $answer => $cnt):
+              if (isset($allKnown[$answer])) continue;
+              $share = $tot > 0 ? (int)round(100*(int)$cnt/$tot) : 0;
+        ?>
+          <div class="choice-stat">
+            <div class="marker">?</div>
+            <div class="text"><em><?= htmlspecialchars($answer) ?></em> <span class="hint"><?= t('unknown_answer') ?></span></div>
+            <div class="mini-bar"><span style="width:<?= $share ?>%;"></span></div>
+            <div class="count"><?= (int)$cnt ?> · <?= $share ?>&nbsp;%</div>
+          </div>
         <?php endforeach; ?>
-      </ul>
-    </div>
+      </div>
     <?php endforeach; ?>
+  <?php endif; ?>
+
+  <div class="button-row">
+    <a class="btn" href="<?= htmlspecialchars($_SERVER['REQUEST_URI']) ?>"><?= t('refresh') ?></a>
+    <a class="btn secondary" href="<?= htmlspecialchars(quiz_url($id)) ?>" target="_blank"><?= t('open_student_quiz') ?></a>
+    <?php if ($attempts > 0): ?>
+      <a class="btn secondary" href="export.php?id=<?= urlencode($id) ?>&amp;t=<?= urlencode($token) ?>&amp;format=xlsx"><?= t('export_excel') ?></a>
+      <a class="btn secondary" href="export.php?id=<?= urlencode($id) ?>&amp;t=<?= urlencode($token) ?>&amp;format=csv"><?= t('export_csv') ?></a>
     <?php endif; ?>
+  </div>
+</div>
 
+<!-- Expiry management -->
+<div class="card">
+  <h3 style="margin-top:0;"><?= t('expiry_label') ?></h3>
+  <p class="hint" style="margin-bottom:14px;"><?= t('expiry_hint') ?></p>
 
+  <form method="post" style="display:flex; flex-wrap:wrap; gap:8px; align-items:end;">
+    <input type="hidden" name="id" value="<?= htmlspecialchars($id) ?>">
+    <input type="hidden" name="t" value="<?= htmlspecialchars($token) ?>">
+    <input type="hidden" name="action" value="set_expiry">
 
-<?php
-render_footer();
+    <button type="submit" name="mode" value="+1m" class="btn secondary"><?= t('extend_1m') ?></button>
+    <button type="submit" name="mode" value="+3m" class="btn secondary"><?= t('extend_3m') ?></button>
+    <button type="submit" name="mode" value="+1y" class="btn secondary"><?= t('extend_1y') ?></button>
+    <button type="submit" name="mode" value="never" class="btn secondary"><?= t('set_never') ?></button>
+
+    <span class="sep" style="margin:0 4px; color:var(--text-soft);">|</span>
+
+    <input type="date" name="expiry_date"
+           value="<?= $expiresAt ? date('Y-m-d', strtotime($expiresAt)) : date('Y-m-d', strtotime('+30 days')) ?>"
+           min="<?= date('Y-m-d') ?>"
+           style="padding:9px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); font-family:inherit; font-size:0.92rem; background:var(--surface); color:var(--text);">
+    <button type="submit" name="mode" value="date" class="btn secondary"><?= t('set_date') ?></button>
+  </form>
+</div>
+
+<!-- Danger zone -->
+<div class="card danger-zone">
+  <h3 style="margin-top:0; color:var(--danger);"><?= t('danger_zone') ?></h3>
+
+  <div id="delete-prompt" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+    <button type="button" class="btn danger" onclick="document.getElementById('delete-prompt').style.display='none'; document.getElementById('delete-confirm').style.display='block';">
+      <?= t('delete_quiz') ?>
+    </button>
+    <span class="hint"><?= t('delete_confirm_text') ?></span>
+  </div>
+
+  <div id="delete-confirm" style="display:none;">
+    <div class="alert error" style="margin-bottom:14px;">
+      <?= t('delete_confirm_text') ?>
+    </div>
+    <form method="post" style="display:flex; gap:10px; flex-wrap:wrap;">
+      <input type="hidden" name="id" value="<?= htmlspecialchars($id) ?>">
+      <input type="hidden" name="t" value="<?= htmlspecialchars($token) ?>">
+      <input type="hidden" name="action" value="delete">
+      <button type="submit" class="btn danger"><?= t('delete_confirm_btn') ?></button>
+      <button type="button" class="btn secondary" onclick="document.getElementById('delete-confirm').style.display='none'; document.getElementById('delete-prompt').style.display='flex';">
+        <?= t('delete_cancel') ?>
+      </button>
+    </form>
+  </div>
+</div>
+
+<?php require __DIR__ . '/lib/footer.php'; ?>
